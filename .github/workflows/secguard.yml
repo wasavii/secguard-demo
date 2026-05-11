@@ -1,0 +1,106 @@
+name: SecGuard CRA Gate
+
+# 任何 PR 開 / 推 commit 都會跑這個 workflow
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  cra-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────────
+      # 1. 用 anchore/syft 產 CycloneDX SBOM
+      # ──────────────────────────────────────────────────────────
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: sbom.cdx.json
+          upload-artifact: false
+          output-file: sbom.cdx.json
+
+      - name: SBOM preview
+        run: |
+          echo "Components: $(jq '.components|length' sbom.cdx.json)"
+          jq '.components | map({name, version}) | .[:8]' sbom.cdx.json
+
+      # ──────────────────────────────────────────────────────────
+      # 2. POST SBOM 到 SecGuard，創 artifact 並 ingest
+      # ──────────────────────────────────────────────────────────
+      - name: SecGuard CRA gate
+        env:
+          SECGUARD_TOKEN:   ${{ secrets.SECGUARD_TOKEN }}
+          SECGUARD_API_URL: ${{ secrets.SECGUARD_API_URL }}
+          # 這裡的 release id 在第一次 demo 時手動填一個固定值。production 時請改用 product slug 動態查。
+          REL_ID: 11e3b23f-6ef8-45b0-a48f-ebcd529a7c48
+          REPO: ${{ github.repository }}
+          SHA:  ${{ github.sha }}
+          PR:   ${{ github.event.pull_request.number || 0 }}
+          REF:  ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          echo "▶ create artifact"
+          ART=$(curl -fsS -X POST "$SECGUARD_API_URL/releases/$REL_ID/artifacts" \
+            -H "Authorization: Bearer $SECGUARD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"type\":\"source\",
+              \"uri\":\"github://$REPO@$SHA\",
+              \"auto_scan\": false,
+              \"build_context\": {
+                \"commit_sha\":\"$SHA\",
+                \"pr_number\": ${PR:-0},
+                \"repo_url\":\"https://github.com/$REPO\",
+                \"workflow_run_url\":\"https://github.com/$REPO/actions/runs/${{ github.run_id }}\"
+              }
+            }")
+          ART_ID=$(echo "$ART" | jq -r .id)
+          echo "  artifact_id=$ART_ID"
+
+          echo "▶ ingest SBOM"
+          curl -fsS -X POST "$SECGUARD_API_URL/artifacts/$ART_ID/sbom" \
+            -H "Authorization: Bearer $SECGUARD_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @sbom.cdx.json | jq '. | {sbom_id, component_count}'
+
+          echo "▶ waiting for match_vulnerabilities (max 30s)..."
+          sleep 25
+
+          echo "▶ gate-check"
+          GATE=$(curl -fsS -X POST "$SECGUARD_API_URL/releases/$REL_ID/gate-check" \
+            -H "Authorization: Bearer $SECGUARD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"$SHA\",\"repo\":\"$REPO\",\"pr_number\":${PR:-0}}")
+          echo "$GATE" | jq .
+
+          PASSED=$(echo "$GATE" | jq -r .passed)
+          BLOCKED=$(echo "$GATE" | jq -r '.stats.blocked_count')
+
+          {
+            echo "## SecGuard CRA Gate"
+            echo
+            if [[ "$PASSED" == "true" ]]; then
+              echo "✅ **PASS** — 沒有 P0/P1/KEV-blocked finding"
+            else
+              echo "❌ **FAIL** — $BLOCKED 條 finding 阻擋 release"
+              echo
+              echo "| CVE | Component | Priority | KEV | 阻擋原因 |"
+              echo "|---|---|---|---|---|"
+              echo "$GATE" | jq -r '.blocked_findings[] | "| \(.cve_id) | \(.component_purl) | \(.priority) | \(if .in_kev then "★" else "—" end) | \(.blocked_by | join(", ")) |"'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$PASSED" != "true" ]]; then
+            echo "::error::SecGuard CRA gate failed — $BLOCKED findings blocked"
+            exit 1
+          fi
